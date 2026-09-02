@@ -46,33 +46,70 @@ def run(event=None, context=None):
         # monitoredAccounts comes back empty.
         #
         # For this test run only: if nothing came back, scan the master
-        # account itself instead, restricted to us-east-1 via
-        # configuredRegions — the same OPTIONAL per-account override
-        # accountOrchestrator.scanAccount() already reads from a real
-        # DynamoDB row (see its docstring/PATCH NOTE). accountOrchestrator.py,
-        # config.py, and every other file are UNCHANGED — this override is
-        # entirely local to this function.
+        # account itself instead. accountOrchestrator.py, config.py, and
+        # every other file are UNCHANGED — this override is entirely
+        # local to this function.
         #
         # Gated behind TEST_SCAN_MASTER_ACCOUNT so it's a no-op by default
         # in any environment where that variable isn't set.
-        #
-        # TO REMOVE LATER: delete this whole block (between the ---- markers)
-        # and unset TEST_SCAN_MASTER_ACCOUNT from the Lambda's environment.
-        # Once real sub-account rows exist in MARRIOTTCSAOSubAccountInfo,
-        # this block also stops firing on its own (it only applies when
-        # monitoredAccounts is empty), so it's safe to leave in place for a
-        # while if you'd rather not touch the code again right away.
         if os.environ.get("TEST_SCAN_MASTER_ACCOUNT", "") and not monitoredAccounts:
             logUtils.logInfo(
                 MODULE_NAME,
                 f"TEST_SCAN_MASTER_ACCOUNT set and no sub-accounts found in "
-                f"MARRIOTTCSAOSubAccountInfo — scanning master account "
-                f"{masterAccountId} only, region us-east-1"
+                f"MARRIOTTCSAOSubAccountInfo — falling back to master account "
+                f"{masterAccountId}"
             )
-            monitoredAccounts = [{
-                "accountId": masterAccountId,
-                "configuredRegions": ["us-east-1"],
-            }]
+            monitoredAccounts = [{"accountId": masterAccountId}]
+        # --------------------------------------------------------------------
+
+        # --- TEMP TESTING OVERRIDE (2026-09-03, cont'd) --------------------
+        # Restrict this run to specific account(s) — e.g. ONLY 883113265457
+        # — instead of everything getMonitoredSubAccounts() (or the
+        # TEST_SCAN_MASTER_ACCOUNT fallback above) produced.
+        # TEST_ACCOUNT_ID_OVERRIDE is comma-separated, applied AFTER the
+        # fallback above, so it works no matter where monitoredAccounts
+        # came from.
+        #
+        # Paired with TEST_REGION_OVERRIDE (also optional, comma-separated)
+        # to pin every surviving account to a small region list. This is
+        # the piece that actually fixes a run like the one in the
+        # CloudWatch log that prompted this change: eu-west-3 (and
+        # presumably other auto-discovered regions on 883113265457) getting
+        # hit with an SCP AccessDeniedException on nearly every
+        # Bedrock/CloudWatch call, one region after another, until the
+        # Lambda ran out of time (Status: timeout, ~423s billed). Filtering
+        # the ACCOUNT list alone does not fix that if the one remaining
+        # account still has many regions enabled — restrict both together.
+        #
+        # TO REMOVE LATER: delete this whole block and unset both env vars.
+        # No other file needs to change either way.
+        testAccountIds = [a.strip() for a in os.environ.get("TEST_ACCOUNT_ID_OVERRIDE", "").split(",") if a.strip()]
+        testRegions = [r.strip() for r in os.environ.get("TEST_REGION_OVERRIDE", "").split(",") if r.strip()]
+
+        if testAccountIds:
+            beforeCount = len(monitoredAccounts)
+            monitoredAccounts = [a for a in monitoredAccounts if str(a.get("accountId")) in testAccountIds]
+
+            # Requested account wasn't present in whatever
+            # getMonitoredSubAccounts()/the master-account fallback
+            # returned — synthesize an entry so the override still does
+            # something instead of silently scanning zero accounts.
+            if not monitoredAccounts:
+                monitoredAccounts = [{"accountId": accId} for accId in testAccountIds]
+
+            logUtils.logInfo(
+                MODULE_NAME,
+                f"TEST_ACCOUNT_ID_OVERRIDE={testAccountIds} — filtered monitoredAccounts "
+                f"from {beforeCount} to {len(monitoredAccounts)}"
+            )
+
+        if testRegions:
+            for accountInfo in monitoredAccounts:
+                accountInfo["configuredRegions"] = testRegions
+            logUtils.logInfo(
+                MODULE_NAME,
+                f"TEST_REGION_OVERRIDE={testRegions} — pinned every account above to these region(s)"
+            )
         # --------------------------------------------------------------------
 
         logUtils.logInfo(MODULE_NAME, f"Scanning {len(monitoredAccounts)} sub-account(s)")
