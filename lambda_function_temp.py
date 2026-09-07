@@ -1,156 +1,233 @@
 """
-lambda_function.py
+accountOrchestrator.py
 
-Entry point. Deployed in the MASTER account (same deployment model as the
-CSAO remediation Lambdas). For every sub-account listed in the
-AIInventoryMonitoredAccounts DynamoDB table: scans its configured regions
-for its configured services, and merges everything into one run. Output
-is written ONCE, from the master account's own credentials, to the
-master account's S3 bucket.
+Runs the full scan for ONE sub-account. Unlike the remediation codebase
+(where one Lambda invocation always concerns exactly one account, taken
+from the triggering event), this scanner must cover EVERY monitored
+account in one run — so lambda_function.py calls scanAccount() once per
+item returned by MarriottCSAO_utils.getMonitoredSubAccounts().
 
-PATCH NOTE (2026-09-05): account+region discovery now happens UP FRONT,
-for every account, before any scanning starts -- previously, each
-account's regions were only discovered lazily, right when that account's
-turn came up inside accountOrchestrator.scanAccount(). This block below
-resolves every account's regions first (still one DynamoDB read for the
-account list, then one ec2:DescribeRegions call per account that doesn't
-have a configuredRegions override), prints the full picture, and caches
-each account's resolved regions directly onto its accountInfo dict so
-scanAccount() doesn't re-discover them a second time.
+PATCH NOTE (2026-09-03): region scope no longer REQUIRES a
+'configuredRegions' attribute in DynamoDB. 'configuredRegions' is now an
+OPTIONAL override; when absent, regions are auto-discovered per account
+via ec2:DescribeRegions.
 
-Also runnable directly for local testing: `python lambda_function.py`.
+PATCH NOTE (2026-09-05): _discoverAccountRegions() renamed to
+discoverAccountRegions() (no leading underscore). lambda_function.py now
+resolves every account's regions UPFRONT, before any scanning starts (so
+it can print the full account+region picture immediately), and caches
+the result directly onto each accountInfo dict's 'configuredRegions'
+key. scanAccount() below still calls discoverAccountRegions() itself as
+a fallback for any caller that DIDN'T pre-resolve regions (e.g. calling
+scanAccount() directly/standalone) — so this file works correctly either
+way, it just won't re-discover regions a second time when
+lambda_function.py has already done it.
 """
-import json
-import traceback
-from datetime import datetime, timezone
-from concurrent.futures import ThreadPoolExecutor, as_completed
-
-from src.utils import logUtils, MarriottCSAO_utils, customErrors
-from src.helpers import s3OutputHelper
-from src.accountOrchestrator import scanAccount, discoverAccountRegions, HANDLER_CLASSES
+from src.utils import logUtils, MarriottCSAO_utils
+from src.helpers import cloudTrailHelper, cloudWatchHelper
+from src.handlers.sagemakerHandler import SageMakerHandler
+from src.handlers.comprehendHandler import ComprehendHandler
+from src.handlers.bedrockHandler import BedrockHandler
 from src.config import config
 
 MODULE_NAME = __file__
 
+# Add a new service by (1) writing a new leaf handler class in
+# src/handlers/, same as adding a new rule handler in the remediation
+# codebase, and (2) registering it here.
+HANDLER_CLASSES = {
+    "sagemaker": SageMakerHandler,
+    "comprehend": ComprehendHandler,
+    "bedrock": BedrockHandler,
+}
 
-def run(event=None, context=None):
-    logUtils.logInfo(MODULE_NAME, "Inside " + run.__name__)
+
+def scanAccount(accountInfo):
+    """
+    accountInfo: one item from MarriottCSAO_utils.getMonitoredSubAccounts()
+      — expected shape: {accountId, configuredRegions?, configuredServices?}
+      (configuredRegions / configuredServices are both OPTIONAL overrides;
+      see discoverAccountRegions() and config.SERVICES for the defaults
+      used when they're absent. lambda_function.py now typically
+      pre-populates configuredRegions before this is ever called — see
+      PATCH NOTE above — but the fallback here still works standalone.)
+
+    Returns:
+      {
+        "account_id": ...,
+        "rows": {"sagemaker": [...], "comprehend": [...], "bedrock": [...]},
+        "bedrock_model_usage": [...],
+        "bedrock_logging_status": [...],
+        "errors": [...],
+      }
+    """
+    logUtils.logInfo(MODULE_NAME, "Inside " + scanAccount.__name__)
+
+    accountId = str(accountInfo.get("accountId"))
+    result = {
+        "account_id": accountId,
+        "rows": {name: [] for name in HANDLER_CLASSES},
+        "bedrock_model_usage": [],
+        "bedrock_logging_status": [],
+        "errors": [],
+    }
+
     try:
-        if not config.OUTPUT_BUCKET:
-            raise customErrors.GenericError(
-                config.GENERIC_ERROR_STATUS_CODE, config.GENERIC_ERROR_MESSAGE,
-                "OUTPUT_BUCKET environment variable must be set"
+        services = accountInfo.get("configuredServices") or config.SERVICES
+
+        # configuredRegions is an OPTIONAL manual override (from DynamoDB)
+        # OR may already be pre-populated by lambda_function.py's upfront
+        # discovery pass. Only fall back to a fresh ec2:DescribeRegions
+        # call here if nobody has resolved it yet.
+        regions = accountInfo.get("configuredRegions")
+        if not regions:
+            logUtils.logDebug(
+                MODULE_NAME,
+                f"[{accountId}] No configuredRegions set — auto-discovering enabled regions"
             )
+            regions = discoverAccountRegions(accountId)
 
-        masterAccountId = MarriottCSAO_utils.getMasterAccountId()
-        logUtils.logInfo(MODULE_NAME, f"Master account: {masterAccountId}")
+        if not regions:
+            logUtils.logInfo(
+                MODULE_NAME,
+                f"[{accountId}] Could not determine any region to scan (no override, "
+                "and ec2:DescribeRegions returned nothing/failed) — skipping account"
+            )
+            result["errors"].append({
+                "account": accountId, "region": None, "source": "accountOrchestrator",
+                "error_type": "NoRegionsResolved",
+                "error": f"No configuredRegions override and region auto-discovery found "
+                         f"nothing for {accountId} — check ec2:DescribeRegions permission "
+                         f"on {config.TARGET_MGMT_ROLE} in that account.",
+            })
+            return result
 
-        # Accounts come straight from the MARRIOTTCSAOSubAccountInfo
-        # DynamoDB table (see MarriottCSAO_utils.getMonitoredSubAccounts()).
-        # This is the "X accounts to scan" count.
-        monitoredAccounts = MarriottCSAO_utils.getMonitoredSubAccounts()
-        print(f"Found {len(monitoredAccounts)} account(s) to scan")
+        logUtils.logDebug(MODULE_NAME, f"[{accountId}] scanning regions={regions} services={services}")
 
-        # --- Resolve + print every account's regions UP FRONT ------------
-        # Runs before any actual scanning starts. For each account: use
-        # its configuredRegions override from DynamoDB if set, otherwise
-        # call ec2:DescribeRegions now (not later) to auto-discover. The
-        # resolved list is written back onto accountInfo['configuredRegions']
-        # so scanAccount() picks it up directly instead of re-discovering.
-        print("Resolving regions for every account before scanning begins...")
-        for accountInfo in monitoredAccounts:
-            accountId = str(accountInfo.get("accountId"))
-            regions = accountInfo.get("configuredRegions")
-            if not regions:
-                regions = discoverAccountRegions(accountId)
-                accountInfo["configuredRegions"] = regions
-            print(f"Account {accountId}: {len(regions)} region(s) -> {regions}")
-        # -------------------------------------------------------------------
-
-        logUtils.logInfo(MODULE_NAME, f"Scanning {len(monitoredAccounts)} sub-account(s)")
-
-        combined = {name: [] for name in HANDLER_CLASSES}
-        bedrockModelUsage = []
-        bedrockLoggingStatus = []
-        allErrors = []
-        accountsScanned = []
-
-        # Each account's scan is independent, slow, I/O-bound work (many
-        # AWS API calls per region), so accounts are scanned concurrently
-        # rather than one at a time — otherwise an org-wide, all-region
-        # scan risks exceeding the Lambda timeout.
-        with ThreadPoolExecutor(max_workers=config.MAX_CONCURRENT_ACCOUNTS) as pool:
-            futures = {
-                pool.submit(scanAccount, accountInfo): str(accountInfo.get("accountId"))
-                for accountInfo in monitoredAccounts
-            }
-            for future in as_completed(futures):
-                accountId = futures[future]
-                try:
-                    result = future.result()
-                except Exception as e:
-                    logUtils.logError(MODULE_NAME, e)
-                    allErrors.append({
-                        "account": accountId, "region": None, "source": "scanAccount",
-                        "error_type": type(e).__name__, "error": str(e),
-                    })
+        for region in regions:
+            for service in services:
+                # print(f"Scanning account={accountId} region={region} service={service}")
+                handlerCls = HANDLER_CLASSES.get(service)
+                if handlerCls is None:
+                    logUtils.logInfo(MODULE_NAME, f"Unknown service '{service}' in configuredServices — skipping")
                     continue
 
-                accountsScanned.append(accountId)
-                for service, rows in result["rows"].items():
-                    combined[service].extend(rows)
-                bedrockModelUsage.extend(result["bedrock_model_usage"])
-                bedrockLoggingStatus.extend(result["bedrock_logging_status"])
-                allErrors.extend(result["errors"])
+                try:
+                    ctClient = MarriottCSAO_utils.getAwsClient(config.SERVICE_NAME['CLOUDTRAIL'], accountId, region)
+                    creatorLookup = cloudTrailHelper.buildCreatorLookup(
+                        ctClient, region, handlerCls.eventNames, config.LOOKBACK_DAYS
+                    ) if ctClient else {}
 
-        dateStr = datetime.now(timezone.utc).strftime("%Y-%m-%d")
-        baseKey = f"{config.OUTPUT_PREFIX}/master-account={masterAccountId}/date={dateStr}"
+                    handler = handlerCls(service, accountId, region, creatorLookup)
+                    result["rows"][service].extend(handler.scan())
+                    result["errors"].extend(handler.errors)
 
-        for service, rows in combined.items():
-            s3OutputHelper.writeJsonToS3(masterAccountId, f"{baseKey}/{service}_resources.json", rows)
-        s3OutputHelper.writeJsonToS3(masterAccountId, f"{baseKey}/bedrock_model_usage.json", bedrockModelUsage)
+                    if service == "bedrock":
+                        result["bedrock_logging_status"].append(handler.getLoggingStatus())
+                        _mergeBedrockUsage(accountId, region, result)
 
-        summary = {
-            "master_account_id": masterAccountId,
-            "generated_at": datetime.now(timezone.utc).isoformat(),
-            "accounts_in_scope": [str(a.get("accountId")) for a in monitoredAccounts],
-            "accounts_scanned_successfully": accountsScanned,
-            "counts": {service: len(rows) for service, rows in combined.items()},
-            "bedrock_models_with_recorded_invocations": len(bedrockModelUsage),
-            "cloudwatch_lookback_days": config.CLOUDWATCH_LOOKBACK_DAYS,
-            "bedrock_invocation_logging_status": bedrockLoggingStatus,
-            "call_errors": allErrors,
-            "output_location": f"s3://{config.OUTPUT_BUCKET}/{baseKey}/",
-        }
-        s3OutputHelper.writeJsonToS3(masterAccountId, f"{baseKey}/summary.json", summary)
+                    if service == "sagemaker":
+                        _mergeSageMakerUsage(accountId, region, result)
 
-        # One-line summary print, for quick eyeballing in the Lambda
-        # console/CloudWatch log stream without opening summary.json in S3.
-        print(f"Summary: {json.dumps(summary, default=str)}")
+                    if service == "comprehend":
+                        _mergeComprehendUsage(accountId, region, result)
 
-        logUtils.logInfo(MODULE_NAME, json.dumps(summary, indent=2, default=str))
-        return summary
+                except Exception as e:
+                    logUtils.logError(MODULE_NAME, e)
+                    result["errors"].append({
+                        "account": accountId, "region": region, "source": f"{service}:handler",
+                        "error_type": type(e).__name__, "error": str(e),
+                    })
 
     except Exception as e:
-        if hasattr(e, 'error') and hasattr(e, 'errorMessage'):
-            error = e
-        else:
-            error = customErrors.GenericError(config.GENERIC_ERROR_STATUS_CODE, config.GENERIC_ERROR_MESSAGE, str(e))
-        logUtils.logError(MODULE_NAME, error)
-        raise
+        logUtils.logError(MODULE_NAME, e)
+        result["errors"].append({
+            "account": accountId, "region": None, "source": "accountOrchestrator",
+            "error_type": type(e).__name__, "error": str(e),
+        })
+
+    return result
 
 
-def lambda_handler(event, context):
+def discoverAccountRegions(accountId):
+    """
+    Inside " + discoverAccountRegions.__name__ — returns every region
+    enabled for this account, via ec2:DescribeRegions (AllRegions=False
+    returns only OPTED-IN/enabled regions). Uses the same getAwsClient
+    flow as every other AWS call here, so it transparently assumes into
+    the sub-account if needed. Always returns a list (never raises) — a
+    failure here is just "no regions discovered", handled by the caller.
+
+    Renamed from _discoverAccountRegions (no leading underscore) —
+    lambda_function.py now calls this directly, upfront for every
+    account, to print the full account+region picture before any
+    scanning starts. See PATCH NOTE at the top of this file.
+    """
+    logUtils.logInfo(MODULE_NAME, "Inside " + discoverAccountRegions.__name__)
     try:
-        return run(event, context)
-    except Exception:
-        # Surface the full traceback in Lambda logs, not just str(e), so
-        # setup-level failures (e.g. missing OUTPUT_BUCKET, or the
-        # MARRIOTTCSAOSubAccountInfo table being unreachable) are easy to
-        # diagnose.
-        traceback.print_exc()
-        raise
+        ec2Client = MarriottCSAO_utils.getAwsClient(config.SERVICE_NAME['EC2'], accountId, 'us-east-1')
+        if not ec2Client:
+            return []
+        response = ec2Client.describe_regions(AllRegions=False)
+        return sorted(r['RegionName'] for r in response['Regions'])
+    except Exception as e:
+        logUtils.logError(MODULE_NAME, e)
+        return []
 
 
-if __name__ == "__main__":
-    run()
+# ---------------------------------------------------------------------
+# CloudWatch usage merges
+# ---------------------------------------------------------------------
+
+def _mergeBedrockUsage(accountId, region, result):
+    logUtils.logInfo(MODULE_NAME, "Inside " + _mergeBedrockUsage.__name__)
+    try:
+        cwClient = MarriottCSAO_utils.getAwsClient(config.SERVICE_NAME['CLOUDWATCH'], accountId, region)
+        if not cwClient:
+            return
+        usage = cloudWatchHelper.getCloudWatchUsage(
+            cwClient, region, "AWS/Bedrock", "Invocations", "ModelId", config.CLOUDWATCH_LOOKBACK_DAYS
+        )
+        for modelId, u in usage.items():
+            result["bedrock_model_usage"].append({
+                "model_id": modelId, "region": region, "account": accountId, **u
+            })
+    except Exception as e:
+        logUtils.logError(MODULE_NAME, e)
+
+
+def _mergeSageMakerUsage(accountId, region, result):
+    logUtils.logInfo(MODULE_NAME, "Inside " + _mergeSageMakerUsage.__name__)
+    try:
+        cwClient = MarriottCSAO_utils.getAwsClient(config.SERVICE_NAME['CLOUDWATCH'], accountId, region)
+        if not cwClient:
+            return
+        usage = cloudWatchHelper.getCloudWatchUsage(
+            cwClient, region, "AWS/SageMaker", "Invocations", "EndpointName", config.CLOUDWATCH_LOOKBACK_DAYS
+        )
+        for row in result["rows"]["sagemaker"]:
+            if row["Type"] == "Endpoint" and row["Region"] == region and row["Resource"] in usage:
+                row["Details"].update(usage[row["Resource"]])
+                row["Last Used"] = usage[row["Resource"]]["last_invocation_time"]
+    except Exception as e:
+        logUtils.logError(MODULE_NAME, e)
+
+
+def _mergeComprehendUsage(accountId, region, result):
+    logUtils.logInfo(MODULE_NAME, "Inside " + _mergeComprehendUsage.__name__)
+    try:
+        cwClient = MarriottCSAO_utils.getAwsClient(config.SERVICE_NAME['CLOUDWATCH'], accountId, region)
+        if not cwClient:
+            return
+        usage = cloudWatchHelper.getCloudWatchUsage(
+            cwClient, region, "AWS/Comprehend", "ConsumedInferenceUnits", "EndpointArn", config.CLOUDWATCH_LOOKBACK_DAYS
+        )
+        for row in result["rows"]["comprehend"]:
+            if row["Type"] != "Endpoint" or row["Region"] != region:
+                continue
+            arn = row["Details"].get("endpoint_arn")
+            if arn and arn in usage:
+                row["Details"].update(usage[arn])
+                row["Last Used"] = usage[arn]["last_invocation_time"]
+    except Exception as e:
+        logUtils.logError(MODULE_NAME, e)
